@@ -1,15 +1,3 @@
----
-title: NYCRide Analytics
-emoji: 🚕
-colorFrom: yellow
-colorTo: red
-sdk: streamlit
-sdk_version: 1.39.0
-app_file: streamlit_app.py
-pinned: false
-license: mit
----
-
 # NYCRide Analytics
 
 End-to-end taxi analytics platform — the flagship capstone of
@@ -63,15 +51,24 @@ pytest tests/ -q                # should pass 26/26
 streamlit run streamlit_app.py
 ```
 
-## Deploy to Hugging Face Spaces (free tier)
+## Deploy
+
+**Streamlit Community Cloud** (free, recommended):
 
 ```bash
-REPO=nycride-analytics ./publish.sh
+REPO=nycride-analytics ./publish.sh    # creates the GitHub repo + pushes
 ```
 
-The script creates both the GitHub repo and the HF Space, pushes code to both,
-and prints the live URL. Prerequisites: `gh auth login` and
-`huggingface-cli login` (both free).
+Then at https://share.streamlit.io: New app → pick this repo → `streamlit_app.py` → Deploy.
+Build takes ~2 minutes.
+
+**Self-hosted Docker** (any PaaS: Fly.io, Railway, Render, HF Pro):
+
+```bash
+docker build -t nycride . && docker run -p 7860:7860 nycride
+```
+
+A `Dockerfile` is included in this repo.
 
 ## Dataset
 
