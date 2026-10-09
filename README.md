@@ -4,8 +4,15 @@ End-to-end taxi analytics platform — the flagship capstone of
 [Bits to Builds](https://bitstobuilds.com). Built on the real **NYC TLC Yellow
 Taxi Trip** dataset (public domain).
 
-**Live demo:** {{LIVE_URL}}
-**Source:** {{GITHUB_URL}}
+**Live demo:** <https://nycride-analytics-akd6nraoyprqym6poarhq4.streamlit.app/>
+**Source:** <https://github.com/PJsAcademy/nycride-analytics>
+
+**Tabs:** Dashboard (3D NYC hex-density map, hour × day-of-week heatmap, daily
+revenue, 24-hour demand forecast with GBM vs naive-baseline comparison) ·
+Driver (top-10 high-tip zones, 5-borough fairness audit, live tip predictor
+with baseline comparison and feature importance) · Analytics (NL→SQL with
+example chips and downloadable results) · Methodology (5 decisions with
+"chose / why / what I'd change with 10× the time") · About.
 
 ## What this is
 
