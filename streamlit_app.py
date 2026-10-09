@@ -461,8 +461,8 @@ for col, (tag, body) in zip([i1, i2, i3, i4], insights):
 st.markdown("")
 st.divider()
 
-tab_dashboard, tab_driver, tab_analytics, tab_about = st.tabs(
-    ["📊 Dashboard", "🚗 Driver", "💬 Analytics", "ℹ️ About"]
+tab_dashboard, tab_driver, tab_analytics, tab_method, tab_about = st.tabs(
+    ["📊 Dashboard", "🚗 Driver", "💬 Analytics", "🛠 Methodology", "ℹ️ About"]
 )
 
 
@@ -548,6 +548,70 @@ with tab_dashboard:
         )
         st.altair_chart(line, use_container_width=True)
 
+    st.divider()
+    st.subheader("Hour-ahead demand forecast — GBM vs naive baseline")
+    st.caption("Phase 3's model predicts next-hour pickup count from lag features. "
+               "Shown on the last 48 hours of the slice: actual, GBM, and naive (last-hour) baseline.")
+
+    @st.cache_data(show_spinner="Scoring demand forecast...")
+    def _forecast_tail(silver_df: pd.DataFrame) -> pd.DataFrame:
+        hourly = (silver_df.assign(ts=silver_df["tpep_pickup_datetime"].dt.floor("h"))
+                            .groupby("ts").size().rename("trips").to_frame())
+        if hourly.empty:
+            return pd.DataFrame(columns=["ts", "actual", "gbm", "naive"])
+        hourly = hourly.reindex(
+            pd.date_range(hourly.index.min(), hourly.index.max(), freq="h"), fill_value=0
+        ).rename_axis("ts")
+        for lag in (1, 24, 168):
+            hourly[f"lag{lag}"] = hourly["trips"].shift(lag)
+        hourly["hour"] = hourly.index.hour
+        hourly["dow"]  = hourly.index.dayofweek
+        hourly = hourly.dropna()
+        if hourly.empty:
+            return pd.DataFrame(columns=["ts", "actual", "gbm", "naive"])
+        model = load_demand_model()
+        X = hourly[["lag1", "lag24", "lag168", "hour", "dow"]]
+        hourly["gbm"] = model.predict(X)
+        hourly["naive"] = hourly["lag1"]
+        return hourly.tail(48).reset_index().rename(columns={"trips": "actual"})[["ts", "actual", "gbm", "naive"]]
+
+    fc = _forecast_tail(silver_f)
+    if len(fc) >= 10:
+        fc_long = fc.melt("ts", var_name="series", value_name="trips")
+        color_scale = alt.Scale(
+            domain=["actual", "gbm", "naive"],
+            range=[BRAND_FG, BRAND_YELLOW, "#4A90E2"],
+        )
+        forecast_chart = (
+            alt.Chart(fc_long).mark_line(strokeWidth=2.5, point=False).encode(
+                x=alt.X("ts:T", title="Hour"),
+                y=alt.Y("trips:Q", title="Pickups per hour"),
+                color=alt.Color("series:N", scale=color_scale, title=None,
+                                legend=alt.Legend(orient="top")),
+                strokeDash=alt.StrokeDash(
+                    "series:N",
+                    scale=alt.Scale(domain=["actual", "gbm", "naive"],
+                                    range=[[1, 0], [1, 0], [4, 4]]),
+                    legend=None,
+                ),
+                tooltip=["ts:T", "series:N", alt.Tooltip("trips:Q", format=".1f")],
+            ).properties(height=280)
+        )
+        st.altair_chart(forecast_chart, use_container_width=True)
+
+        def _mape(y, p, eps=1.0):
+            y, p = np.asarray(y, float), np.asarray(p, float)
+            return float(np.mean(np.abs((p - y) / np.maximum(y, eps))))
+        gbm_mape = _mape(fc["actual"], fc["gbm"])
+        naive_mape = _mape(fc["actual"], fc["naive"])
+        improvement = (naive_mape - gbm_mape) / naive_mape * 100 if naive_mape > 0 else 0
+        fc1, fc2, fc3 = st.columns(3)
+        with fc1: kpi_card("GBM MAPE (last 48h)", f"{gbm_mape:.1%}", "lower is better", "🎯", "#50C878")
+        with fc2: kpi_card("Naive baseline MAPE", f"{naive_mape:.1%}", "repeat-last-hour", "📉", "#4A90E2")
+        with fc3: kpi_card("Relative improvement", f"{improvement:+.1f}%", "GBM vs naive", "⚡", BRAND_YELLOW)
+    else:
+        st.info("Need at least 10 hours of data for a forecast. Widen the date filter.")
+
 
 # ------- Driver tab -------
 with tab_driver:
@@ -612,23 +676,66 @@ with tab_driver:
     pct = predicted / fare * 100
     lo, hi = max(0, predicted - overall_mae), predicted + overall_mae
 
-    a, b, c = st.columns([1, 1, 2])
-    with a:
-        kpi_card("Predicted tip", f"${predicted:.2f}", f"{pct:.1f}% of fare", "💝", "#50C878")
-    with b:
-        kpi_card("± MAE band", f"${lo:.2f} – ${hi:.2f}", f"±${overall_mae:.2f} typical error", "📏", "#4A90E2")
-    with c:
-        st.markdown(
-            f"""
-            <div class="insight" style="height:100%;display:flex;align-items:center;">
-              <div><span class="insight-tag">Honest limit</span>
-              on the 10k sample this model's hold-out R² is near zero — it barely beats
-              a linear baseline. On the real 2.9M-row dataset the gap is meaningful.
-              Baseline-first is the Phase 2 lesson, not a defect to hide.</div>
-            </div>
-            """,
-            unsafe_allow_html=True,
+    # Baseline comparison — train a quick linear baseline in-session (cached)
+    @st.cache_resource(show_spinner="Fitting baseline for comparison...")
+    def _baseline_model():
+        from sklearn.compose import ColumnTransformer
+        from sklearn.linear_model import LinearRegression
+        from sklearn.pipeline import Pipeline
+        from sklearn.preprocessing import OneHotEncoder
+        from sklearn.model_selection import train_test_split
+        card = silver[silver["payment_type"] == 1]
+        feats_n = ["trip_distance", "fare_amount", "trip_duration_min", "passenger_count",
+                   "hour", "dow", "is_weekend"]
+        feats_c = ["pickup_borough"]
+        X = card[feats_n + feats_c]; y = card["tip_amount"]
+        X_tr, _, y_tr, _ = train_test_split(X, y, test_size=0.2, random_state=42)
+        pipe = Pipeline([
+            ("pre", ColumnTransformer([("num", "passthrough", feats_n),
+                                       ("cat", OneHotEncoder(handle_unknown="ignore"), feats_c)])),
+            ("lr", LinearRegression()),
+        ]).fit(X_tr, y_tr)
+        return pipe
+
+    baseline_pred = float(_baseline_model().predict(row)[0])
+    diff = predicted - baseline_pred
+
+    a, b, c = st.columns(3)
+    with a: kpi_card("GBM prediction", f"${predicted:.2f}", f"{pct:.1f}% of fare", "💝", "#50C878")
+    with b: kpi_card("Baseline (linear)", f"${baseline_pred:.2f}", "same features, no GBM", "📐", "#4A90E2")
+    with c: kpi_card("GBM − baseline", f"{diff:+.2f}", "the lift (or not) from GBM", "⚡", BRAND_YELLOW)
+
+    st.caption(
+        f"**± MAE band (GBM):** ${lo:.2f} – ${hi:.2f}  ·  "
+        f"On the 10k sample GBM and baseline are near-identical — baseline-first is the Phase 2 lesson, "
+        "not a defect to hide. On real 2.9M-row data the gap widens."
+    )
+
+    # Feature importance from the GBM
+    try:
+        gbm = tip_model.named_steps["gbm"]
+        pre = tip_model.named_steps["pre"]
+        feat_names = (list(pre.transformers_[0][2]) +
+                      list(pre.transformers_[1][1].get_feature_names_out(pre.transformers_[1][2])))
+        importances = pd.DataFrame({
+            "feature": feat_names,
+            "importance": gbm.feature_importances_,
+        }).sort_values("importance", ascending=False).head(10)
+
+        st.subheader("What drives the tip prediction?")
+        st.caption("Top 10 features by GBM impurity-based importance. Higher bar = the model relies on this feature more.")
+        imp_chart = (
+            alt.Chart(importances).mark_bar(cornerRadius=4).encode(
+                x=alt.X("importance:Q", title="Importance"),
+                y=alt.Y("feature:N", sort="-x", title=None),
+                color=alt.Color("importance:Q", scale=alt.Scale(scheme="yelloworangered"),
+                                legend=None),
+                tooltip=["feature", alt.Tooltip("importance:Q", format=".3f")],
+            ).properties(height=280)
         )
+        st.altair_chart(imp_chart, use_container_width=True)
+    except Exception as e:
+        st.caption(f"(feature-importance unavailable: {e})")
 
 
 # ------- Analytics tab -------
@@ -660,6 +767,11 @@ with tab_analytics:
             st.code(sql, language="sql")
             result = run_sql(sql, silver_f)
             st.dataframe(result, use_container_width=True, hide_index=True)
+            d1, d2 = st.columns(2)
+            d1.download_button("⬇ Download SQL", sql.encode(), "nycride_query.sql",
+                               "text/plain", use_container_width=True)
+            d2.download_button("⬇ Download result (CSV)", result.to_csv(index=False).encode(),
+                               "nycride_result.csv", "text/csv", use_container_width=True)
 
     with st.expander("Supported patterns (3)"):
         st.markdown(
@@ -682,6 +794,98 @@ with tab_analytics:
         ).properties(height=320)
     )
     st.altair_chart(zone_bar, use_container_width=True)
+
+
+# ------- Methodology tab -------
+with tab_method:
+    st.markdown(
+        f"""
+        ## Methodology — decisions, tradeoffs, honest shortcuts
+
+        A portfolio project without a methodology section is a portfolio project you can't defend.
+        Below is what I chose, why, and what I'd change with 10× the time.
+
+        ---
+        ### Decision 1 — Why a 3-phase pipeline, not a single notebook?
+
+        **Chose:** Three distinct phases (DE → ML → Forecast), each writes a checkpoint that the next phase reads.
+
+        **Why:** Each phase is independently testable (10 + 7 + 9 invariants), independently runnable
+        (`python src/phase1_pipeline.py`), and the medallion split (bronze → silver → gold) matches
+        what every real data org uses. A single notebook couples cleaning to modeling and makes
+        reproducing one piece require rerunning everything.
+
+        **What I'd change with 10× the time:** add dbt for the silver → gold transformation so the
+        warehouse schema is version-controlled SQL rather than imperative pandas.
+
+        ---
+        ### Decision 2 — Why ship a model whose R² is near zero?
+
+        **Chose:** GBM MAE $%.2f, linear baseline MAE ≈ same, hold-out R² near zero on the 10k sample.
+
+        **Why:** Baseline-first is a non-negotiable ML rule. On the 10k synthetic sample the signal
+        is thin and GBM overfits noise. Hiding that fact behind a cherry-picked metric would be the
+        exact anti-pattern Phase 2 is teaching against. On the real 2.9M-row TLC data the gap widens
+        meaningfully — the demo honestly shows the small-sample regime.
+
+        **What I'd change with 10× the time:** add zone-level features (joined against
+        `taxi_zone_lookup.csv`), weather, and holidays. Expect $0.50-$1.00 MAE improvement on the
+        full dataset.
+
+        ---
+        ### Decision 3 — Why a deterministic regex for NL→SQL instead of an LLM?
+
+        **Chose:** 3-pattern regex mapper with a `None` fallback for anything out of scope.
+
+        **Why:** For 3 patterns, a regex is a 20-line safety-first implementation that never
+        hallucinates. An LLM for 3 patterns is engineering theater — more code, more latency, more
+        failure modes, no new capability. The honest upgrade path is a hybrid: LLM-generated SQL
+        wrapped in a SELECT-only allowlist validator so hallucinated queries can't run.
+
+        **What I'd change with 10× the time:** add the hybrid LLM + allowlist for arbitrary queries,
+        keep the 3 regex patterns as the fast path.
+
+        ---
+        ### Decision 4 — Why synthesise coordinates instead of joining the zone lookup?
+
+        **Chose:** Each row's (lat, lon) comes from a borough centroid + deterministic jitter.
+
+        **Why (honest):** Shortcut. The real TLC zone shapefile is a shapefile — needs `geopandas`,
+        pyproj, GDAL binaries — which inflates the Streamlit Cloud build time and bloats the free-tier
+        memory. For a 10k-row demo the hex-density visualisation is indistinguishable; on real data
+        the join is a one-liner against `taxi_zone_lookup.csv`.
+
+        **What I'd change with 10× the time:** add the real zone geometry and show neighborhood-level
+        insights (e.g. "pickups in Chelsea tip 23%% more than Midtown East").
+
+        ---
+        ### Decision 5 — Why ignore cash tips entirely?
+
+        **Chose:** Phase 2 trains and audits only on `payment_type == 1` (card) rows (~69%% of trips).
+
+        **Why:** TLC records cash tips as $0.00 — the driver pockets them, the meter never sees them.
+        Including cash trips teaches the model that "cash passengers never tip", which is false and
+        would propagate borough-specific bias (poorer neighborhoods use cash more). Dropping cash
+        is the honest choice; what we lose is the ability to predict for cash-paying trips at all.
+
+        **What I'd change with 10× the time:** show a second model trained only on card trips but
+        with a "cash probability" wrapper for the Driver UI, so the app can at least warn
+        "this trip profile is 40%% likely to be cash — tip estimate uncertain".
+
+        ---
+
+        ## What a staff engineer would flag that I left in
+
+        - **No feature store.** Every reload recomputes features from silver. Fine at 10k rows, breaks
+          at 2.9M. The upgrade is `feast` or a materialised view in the warehouse.
+        - **No model monitoring.** The invariants validate on build, not on live predictions. In prod,
+          daily re-runs of the invariants on the previous day's traffic would catch drift.
+        - **No concept of recency.** The GBM uses lag1/24/168 but no decaying weight for recent
+          observations. Weekend-vs-weekday splits with recency weighting would reduce MAPE further.
+        - **The `nl_to_sql` executor is pattern-matched, not actual SQL.** A single DuckDB query engine
+          swap would make it general-purpose, at the cost of 15MB more in the Space.
+        """ % (overall_mae,)
+    )
 
 
 # ------- About tab -------
