@@ -1,21 +1,15 @@
 """NYCRide Analytics — Streamlit demo for the Bits to Builds flagship capstone.
 
-Tabs:
-  1. Dashboard  — hero KPIs, pydeck hex-density map of NYC pickups, hour-x-DOW
-                  demand heatmap, daily revenue line.
-  2. Driver     — top high-tip zones, tip-prediction form with honest-limit
-                  callout, 5-borough fairness audit chart.
-  3. Analytics  — NL->SQL interface over the silver warehouse (safety fallback
-                  when a question doesn't match the 3 known patterns), plus a
-                  top-10-zones bar chart.
-  4. About      — honest project description + limits.
+Tabs: Dashboard / Driver / Analytics / About.
+Sidebar: brand, filters, data freshness, downloads, credits.
 
-Checkpoints come from either (a) joblib-loadable files in checkpoints/, or
-(b) a first-run bootstrap that calls phase1/2/3 directly. Immune to pickle
-version shifts between local training and deployed runtime.
+Checkpoints come from either joblib-loadable files or a first-run bootstrap that
+calls phase1/2/3 directly. Immune to pickle version shifts between training and
+deployed runtime.
 """
 from __future__ import annotations
 
+import io
 import re
 import sys
 from pathlib import Path
@@ -31,9 +25,14 @@ HERE = Path(__file__).parent
 CHECKPOINTS = HERE / "checkpoints"
 BOROUGHS = ["Manhattan", "Bronx", "Brooklyn", "Queens", "Staten Island"]
 
-# Rough borough centroids (lat, lon) + airports. Used to project zone IDs onto
-# a map; synthesised sample has no real geometry, so we jitter deterministically
-# around the centroid. On real TLC data, join against taxi_zone_lookup.csv.
+BRAND_YELLOW = "#FFC72C"
+BRAND_RED = "#E63946"
+BRAND_INK = "#0E1117"
+BRAND_INK2 = "#171B22"
+BRAND_INK3 = "#232833"
+BRAND_FG = "#E7E9EC"
+BRAND_FG_DIM = "#9AA3B2"
+
 BOROUGH_CENTROIDS = {
     "Manhattan":     (40.776, -73.965),
     "Bronx":         (40.845, -73.865),
@@ -45,15 +44,23 @@ AIRPORT_COORDS = {132: (40.6413, -73.7781), 138: (40.7769, -73.8740), 1: (40.689
 
 sys.path.insert(0, str(HERE / "src"))
 
-st.set_page_config(page_title="NYCRide Analytics", page_icon="🚕", layout="wide")
+st.set_page_config(
+    page_title="NYCRide Analytics",
+    page_icon="🚕",
+    layout="wide",
+    initial_sidebar_state="expanded",
+    menu_items={
+        "About": "NYCRide Analytics — flagship capstone of Bits to Builds. "
+                 "Source: github.com/PJsAcademy/nycride-analytics",
+        "Get help": "https://github.com/PJsAcademy/nycride-analytics/issues",
+    },
+)
 
 
 # ======================================================= bootstrap
 
 @st.cache_resource(show_spinner="First-time setup: building silver + ML + forecast (~30s)...")
 def bootstrap_checkpoints() -> None:
-    """Rebuild checkpoints from source if any are missing or fail to load.
-    Runs once per container; deterministic (seed=42)."""
     required = [
         CHECKPOINTS / "silver.parquet",
         CHECKPOINTS / "tip_model.pkl",
@@ -79,66 +86,81 @@ def bootstrap_checkpoints() -> None:
 bootstrap_checkpoints()
 
 
-# ======================================================= loaders (cached)
+# ======================================================= loaders
 
 @st.cache_data(show_spinner="Loading silver warehouse...")
 def load_silver() -> pd.DataFrame:
     df = pd.read_parquet(CHECKPOINTS / "silver.parquet")
-    # Deterministic (lat, lon) per row from borough centroid + jitter. On real
-    # TLC data this is replaced by a join against taxi_zone_lookup.csv.
     rng = np.random.default_rng(42)
     lats = np.empty(len(df))
     lons = np.empty(len(df))
     for i, (pul, bor) in enumerate(zip(df["PULocationID"].values, df["pickup_borough"].values)):
         if pul in AIRPORT_COORDS:
             lat0, lon0 = AIRPORT_COORDS[pul]
-            jitter_scale = 0.004
+            jit = 0.004
         else:
             lat0, lon0 = BOROUGH_CENTROIDS.get(bor, BOROUGH_CENTROIDS["Manhattan"])
-            jitter_scale = 0.025
-        lats[i] = lat0 + rng.normal(0, jitter_scale)
-        lons[i] = lon0 + rng.normal(0, jitter_scale)
+            jit = 0.025
+        lats[i] = lat0 + rng.normal(0, jit)
+        lons[i] = lon0 + rng.normal(0, jit)
     df["pickup_lat"] = lats
     df["pickup_lon"] = lons
     return df
 
 
-@st.cache_resource(show_spinner="Loading tip-prediction model...")
+@st.cache_resource
 def load_tip_model():
-    # Trusted artifact: produced by src/phase2_ml.py in this repo's own build.
     return joblib.load(CHECKPOINTS / "tip_model.pkl")
 
 
-@st.cache_resource(show_spinner="Loading demand-forecast model...")
+@st.cache_resource
 def load_demand_model():
     return joblib.load(CHECKPOINTS / "demand_model.pkl")
 
 
-@st.cache_data(show_spinner="Loading high-tip zones...")
+@st.cache_data
 def load_high_tip_zones() -> pd.DataFrame:
     return pd.read_csv(CHECKPOINTS / "high_tip_zones.csv")
 
 
 @st.cache_data
-def compute_fairness(silver: pd.DataFrame) -> pd.DataFrame:
-    """Per-borough MAE of the tip model on the card-only subset.
-    Recomputed in-app so the chart matches the numbers in About."""
+def compute_fairness(silver: pd.DataFrame) -> tuple[pd.DataFrame, float]:
     from sklearn.metrics import mean_absolute_error
     from sklearn.model_selection import train_test_split
     model = load_tip_model()
     card = silver[silver["payment_type"] == 1]
     feats = ["trip_distance", "fare_amount", "trip_duration_min", "passenger_count",
              "hour", "dow", "is_weekend", "pickup_borough"]
-    X = card[feats]
-    y = card["tip_amount"]
+    X = card[feats]; y = card["tip_amount"]
     _, X_te, _, y_te = train_test_split(X, y, test_size=0.2, random_state=42)
     yhat = model.predict(X_te)
     audit = pd.DataFrame({"y": y_te.values, "yhat": yhat, "borough": X_te["pickup_borough"].values})
     per = audit.groupby("borough").apply(lambda d: mean_absolute_error(d.y, d.yhat))
-    return per.rename("mae").reset_index().sort_values("mae")
+    per = per.rename("mae").reset_index().sort_values("mae")
+    overall_mae = float(mean_absolute_error(y_te, yhat))
+    return per, overall_mae
 
 
-# ======================================================= Phase 3's NL->SQL mapper
+@st.cache_data
+def top_tip_zone_coords(high_tip: pd.DataFrame, k: int = 5) -> pd.DataFrame:
+    """Project the top-k high-tip zones onto lat/lon via the same borough-centroid
+    scheme used for silver. Deterministic — same jitter seed produces consistent dots."""
+    rng = np.random.default_rng(7)
+    rows = []
+    for _, r in high_tip.sort_values("avg_tip", ascending=False).head(k).iterrows():
+        pul = int(r["PULocationID"])
+        if pul in AIRPORT_COORDS:
+            lat0, lon0 = AIRPORT_COORDS[pul]
+            jit = 0.002
+        else:
+            lat0, lon0 = BOROUGH_CENTROIDS["Manhattan"]  # most high-tip zones concentrate in Manhattan
+            jit = 0.015
+        rows.append({"PULocationID": pul, "avg_tip": r["avg_tip"],
+                     "lat": lat0 + rng.normal(0, jit), "lon": lon0 + rng.normal(0, jit)})
+    return pd.DataFrame(rows)
+
+
+# ======================================================= Phase 3 NL->SQL
 
 def nl_to_sql(question: str) -> str | None:
     if not question:
@@ -185,37 +207,258 @@ def run_sql(sql: str, silver: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame({"error": [f"unsupported SQL pattern: {sql}"]})
 
 
-# ======================================================= header + hero
+# ======================================================= Global CSS
+
+st.markdown(
+    f"""
+    <style>
+    /* Hide Streamlit default chrome a bit */
+    #MainMenu {{visibility: hidden;}}
+    footer {{visibility: hidden;}}
+    header[data-testid="stHeader"] {{background: transparent;}}
+
+    /* Custom KPI cards */
+    .kpi-card {{
+        background: linear-gradient(135deg, {BRAND_INK2} 0%, {BRAND_INK3} 100%);
+        border: 1px solid rgba(255,255,255,0.06);
+        border-left: 4px solid var(--accent, {BRAND_YELLOW});
+        border-radius: 14px;
+        padding: 18px 20px;
+        box-shadow: 0 8px 24px rgba(0,0,0,0.25);
+        height: 100%;
+    }}
+    .kpi-card .kpi-label {{
+        color: {BRAND_FG_DIM};
+        font-size: 12px;
+        font-weight: 500;
+        text-transform: uppercase;
+        letter-spacing: 0.06em;
+        margin-bottom: 6px;
+    }}
+    .kpi-card .kpi-value {{
+        color: {BRAND_FG};
+        font-size: clamp(16px, 1.9vw, 30px);
+        font-weight: 700;
+        line-height: 1.1;
+        font-variant-numeric: tabular-nums;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+    }}
+    .kpi-card .kpi-delta {{
+        display: inline-block;
+        margin-top: 6px;
+        color: {BRAND_FG_DIM};
+        font-size: 12px;
+    }}
+    .kpi-icon {{
+        float: right;
+        font-size: 20px;
+        opacity: 0.35;
+        margin-left: 4px;
+    }}
+    @media (max-width: 1100px) {{ .kpi-icon {{display: none;}} }}
+
+    /* Insight chip */
+    .insight {{
+        background: {BRAND_INK2};
+        border: 1px solid rgba(255,199,44,0.15);
+        border-radius: 10px;
+        padding: 10px 14px;
+        font-size: 13px;
+        color: {BRAND_FG};
+        line-height: 1.45;
+    }}
+    .insight .insight-tag {{
+        color: {BRAND_YELLOW};
+        font-weight: 600;
+        font-size: 11px;
+        text-transform: uppercase;
+        letter-spacing: 0.07em;
+        margin-right: 6px;
+    }}
+
+    /* Hero */
+    .hero {{
+        background: radial-gradient(circle at top left, rgba(255,199,44,0.14) 0%, rgba(14,17,23,0) 55%);
+        padding: 10px 0 16px;
+        margin-bottom: 10px;
+    }}
+    .hero h1 {{
+        font-size: 36px !important;
+        font-weight: 800 !important;
+        margin-bottom: 4px !important;
+    }}
+    .hero .tagline {{color: {BRAND_FG_DIM}; font-size: 15px;}}
+
+    /* Sidebar polish */
+    section[data-testid="stSidebar"] {{background: {BRAND_INK};}}
+    .sidebar-brand {{
+        padding: 6px 4px 20px;
+        border-bottom: 1px solid rgba(255,255,255,0.06);
+        margin-bottom: 14px;
+    }}
+    .sidebar-brand .brand-logo {{font-size: 24px;}}
+    .sidebar-brand .brand-name {{font-size: 18px; font-weight: 700; color: {BRAND_FG};}}
+    .sidebar-brand .brand-sub {{font-size: 12px; color: {BRAND_FG_DIM};}}
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+
+# ======================================================= load data
 
 silver = load_silver()
 tip_model = load_tip_model()
 high_tip = load_high_tip_zones()
-fairness = compute_fairness(silver)
+fairness, overall_mae = compute_fairness(silver)
+top_tip_coords = top_tip_zone_coords(high_tip, 5)
+
+
+# ======================================================= Sidebar
+
+with st.sidebar:
+    st.markdown(
+        f"""
+        <div class="sidebar-brand">
+          <div><span class="brand-logo">🚕</span> <span class="brand-name">NYCRide</span></div>
+          <div class="brand-sub">Flagship capstone · Bits to Builds</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    st.markdown("##### Filters")
+    date_min = silver["tpep_pickup_datetime"].min().date()
+    date_max = silver["tpep_pickup_datetime"].max().date()
+    date_range = st.date_input(
+        "Date range", (date_min, date_max), min_value=date_min, max_value=date_max,
+    )
+    selected_boroughs = st.multiselect("Boroughs", BOROUGHS, default=BOROUGHS)
+
+    st.markdown("##### Data")
+    st.caption(f"**{len(silver):,}** silver rows")
+    st.caption(f"**{date_min} → {date_max}**")
+    st.caption("Sample from NYC TLC Yellow Taxi 2024 (public domain)")
+
+    buf = io.BytesIO()
+    silver.head(1000).drop(columns=["pickup_lat", "pickup_lon"]).to_csv(buf, index=False)
+    st.download_button("⬇ Download silver sample (CSV)", buf.getvalue(),
+                       "nycride_silver_sample.csv", "text/csv", use_container_width=True)
+    st.download_button("⬇ Download high-tip zones", high_tip.to_csv(index=False).encode(),
+                       "high_tip_zones.csv", "text/csv", use_container_width=True)
+
+    st.divider()
+    st.markdown("##### Links")
+    st.markdown("[💻 Source on GitHub](https://github.com/PJsAcademy/nycride-analytics)")
+    st.markdown("[📚 Bits to Builds](https://bitstobuilds.com)")
+    st.markdown("[🚕 NYC TLC dataset](https://www.nyc.gov/site/tlc/about/tlc-trip-record-data.page)")
+
+    st.divider()
+    st.caption(f"GBM MAE **${overall_mae:.2f}**  ·  Fairness gap **${fairness['mae'].max() - fairness['mae'].min():.2f}**")
+
+
+# Apply sidebar filters
+if len(date_range) == 2:
+    d0, d1 = date_range
+    mask = ((silver["tpep_pickup_datetime"].dt.date >= d0) &
+            (silver["tpep_pickup_datetime"].dt.date <= d1))
+    silver_f = silver[mask]
+else:
+    silver_f = silver
+if selected_boroughs:
+    silver_f = silver_f[silver_f["pickup_borough"].isin(selected_boroughs)]
+if len(silver_f) == 0:
+    silver_f = silver  # safety fallback
+
+
+# ======================================================= Hero
 
 st.markdown(
     """
-    # 🚕 NYCRide Analytics
-    End-to-end taxi analytics platform built from **NYC TLC Yellow Taxi** data (public domain).
-    Flagship capstone of the [Bits to Builds](https://bitstobuilds.com) course.
-    """
+    <div class="hero">
+      <h1>🚕 NYCRide Analytics</h1>
+      <div class="tagline">End-to-end taxi analytics on real NYC TLC data · Flagship capstone of <a href="https://bitstobuilds.com" style="color:#FFC72C;">Bits to Builds</a></div>
+    </div>
+    """,
+    unsafe_allow_html=True,
 )
 
-# Hero KPI row
-total_trips = len(silver)
-total_revenue = float(silver["total_amount"].sum())
-median_fare = float(silver["fare_amount"].median())
+
+# ======================================================= KPI cards
+
+def kpi_card(label: str, value: str, delta: str = "", icon: str = "", accent: str = BRAND_YELLOW):
+    st.markdown(
+        f"""
+        <div class="kpi-card" style="--accent:{accent};">
+          <div class="kpi-icon">{icon}</div>
+          <div class="kpi-label">{label}</div>
+          <div class="kpi-value">{value}</div>
+          <div class="kpi-delta">{delta}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+total_trips = len(silver_f)
+total_revenue = float(silver_f["total_amount"].sum())
+median_fare = float(silver_f["fare_amount"].median())
 fairness_gap = float(fairness["mae"].max() - fairness["mae"].min())
+avg_tip = float(silver_f.loc[silver_f["payment_type"] == 1, "tip_amount"].mean())
 
-k1, k2, k3, k4 = st.columns(4)
-k1.metric("Trips (sample)", f"{total_trips:,}")
-k2.metric("Revenue", f"${total_revenue:,.0f}")
-k3.metric("Median fare", f"${median_fare:.2f}")
-k4.metric(
-    "Fairness gap (max-min borough MAE)",
-    f"${fairness_gap:.2f}",
-    help="Lower = model treats boroughs similarly. $0 = perfect parity.",
-)
+def _compact(n: float, prefix: str = "") -> str:
+    """9,945 -> 9.9K; 448,399 -> 448K; 1.2M; small numbers unchanged."""
+    if n >= 1_000_000: return f"{prefix}{n/1_000_000:.1f}M"
+    if n >= 100_000:   return f"{prefix}{n/1_000:.0f}K"
+    if n >= 10_000:    return f"{prefix}{n/1_000:.1f}K"
+    if n >= 1_000:     return f"{prefix}{n/1_000:.2f}K"
+    return f"{prefix}{n:,.0f}"
 
+
+date_days = (silver_f['tpep_pickup_datetime'].dt.date.max() -
+             silver_f['tpep_pickup_datetime'].dt.date.min()).days + 1
+
+k1, k2, k3, k4, k5 = st.columns(5)
+with k1: kpi_card("Trips", _compact(total_trips), f"over {date_days} days", "🚕")
+with k2: kpi_card("Revenue", _compact(total_revenue, "$"), f"${total_revenue/max(total_trips,1):.2f}/trip avg", "💵", BRAND_YELLOW)
+with k3: kpi_card("Median fare", f"${median_fare:.2f}", "p50 of fare_amount", "📊", "#4A90E2")
+with k4: kpi_card("Avg tip", f"${avg_tip:.2f}", f"{avg_tip/median_fare*100:.0f}% of median fare", "💝", "#50C878")
+with k5: kpi_card("Fairness gap", f"${fairness_gap:.2f}", "max-min borough MAE", "⚖️", BRAND_RED)
+
+
+# ======================================================= Insights band
+
+def _busiest_hour() -> int:
+    return int(silver_f["tpep_pickup_datetime"].dt.hour.value_counts().idxmax())
+
+
+def _busiest_day() -> str:
+    return silver_f["tpep_pickup_datetime"].dt.day_name().value_counts().idxmax()
+
+
+def _best_tip_borough() -> str:
+    card = silver_f[silver_f["payment_type"] == 1]
+    if len(card) == 0:
+        return "—"
+    return card.groupby("pickup_borough")["tip_amount"].mean().idxmax()
+
+
+st.markdown("")
+i1, i2, i3, i4 = st.columns(4)
+insights = [
+    ("Peak hour", f"<b>{_busiest_hour():02d}:00</b> is the busiest hour on this slice."),
+    ("Peak day", f"<b>{_busiest_day()}</b> sees the most pickups."),
+    ("Best tips", f"<b>{_best_tip_borough()}</b> pulls the highest average tip."),
+    ("Model honesty", f"GBM MAE <b>${overall_mae:.2f}</b> ≈ linear baseline — baseline-first shipped."),
+]
+for col, (tag, body) in zip([i1, i2, i3, i4], insights):
+    with col:
+        st.markdown(f'<div class="insight"><span class="insight-tag">{tag}</span>{body}</div>',
+                    unsafe_allow_html=True)
+
+st.markdown("")
 st.divider()
 
 tab_dashboard, tab_driver, tab_analytics, tab_about = st.tabs(
@@ -225,45 +468,56 @@ tab_dashboard, tab_driver, tab_analytics, tab_about = st.tabs(
 
 # ------- Dashboard tab -------
 with tab_dashboard:
-    st.subheader("Where pickups happen")
-    st.caption("Hex-density of pickups across NYC. Darker hexes = more trips. Zoom and tilt the map.")
+    st.subheader("Where pickups happen · top-5 tip zones overlaid")
+    st.caption("Hex-density of pickups + glowing dots at the top-5 highest-tip zones. Drag to pan, scroll to zoom, hold ctrl to tilt.")
 
-    layer = pdk.Layer(
+    hex_layer = pdk.Layer(
         "HexagonLayer",
-        data=silver[["pickup_lon", "pickup_lat"]].rename(
-            columns={"pickup_lon": "lon", "pickup_lat": "lat"}
-        ),
+        data=silver_f[["pickup_lon", "pickup_lat"]].rename(columns={"pickup_lon": "lon", "pickup_lat": "lat"}),
         get_position=["lon", "lat"],
         radius=250,
         elevation_scale=4,
         extruded=True,
-        coverage=0.9,
+        coverage=0.85,
+        pickable=True,
+        color_range=[
+            [255, 237, 160], [254, 217, 118], [254, 178, 76],
+            [253, 141, 60], [240, 59, 32], [189, 0, 38],
+        ],
+    )
+    scatter_layer = pdk.Layer(
+        "ScatterplotLayer",
+        data=top_tip_coords,
+        get_position=["lon", "lat"],
+        get_radius=400,
+        get_fill_color=[80, 200, 120, 230],
+        get_line_color=[255, 255, 255, 200],
+        line_width_min_pixels=2,
         pickable=True,
     )
     deck = pdk.Deck(
-        layers=[layer],
-        initial_view_state=pdk.ViewState(
-            latitude=40.74, longitude=-73.95, zoom=10, pitch=45, bearing=0,
-        ),
-        map_style=None,  # defaults to dark basemap on dark theme
+        layers=[hex_layer, scatter_layer],
+        initial_view_state=pdk.ViewState(latitude=40.74, longitude=-73.95, zoom=10, pitch=45),
+        tooltip={"text": "Zone {PULocationID}\nAvg tip ${avg_tip}"},
+        map_style=None,
     )
     st.pydeck_chart(deck, use_container_width=True)
 
     st.divider()
     c1, c2 = st.columns([3, 2])
-
     with c1:
         st.subheader("When pickups happen")
-        st.caption("Trips by hour of day × day of week. Reveals rush hours and weekend patterns.")
-        pivot = (silver.assign(hour=silver["tpep_pickup_datetime"].dt.hour,
-                               dow=silver["tpep_pickup_datetime"].dt.day_name())
-                       .groupby(["dow", "hour"]).size().rename("trips").reset_index())
+        st.caption("Trips by hour × day of week. Rush-hour and weekend patterns at a glance.")
+        pivot = (silver_f.assign(hour=silver_f["tpep_pickup_datetime"].dt.hour,
+                                 dow=silver_f["tpep_pickup_datetime"].dt.day_name())
+                         .groupby(["dow", "hour"]).size().rename("trips").reset_index())
         dow_order = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
         heatmap = (
-            alt.Chart(pivot).mark_rect().encode(
-                x=alt.X("hour:O", title="Hour of day"),
+            alt.Chart(pivot).mark_rect(stroke=BRAND_INK, strokeWidth=1).encode(
+                x=alt.X("hour:O", title="Hour of day", axis=alt.Axis(labelAngle=0)),
                 y=alt.Y("dow:O", sort=dow_order, title=None),
-                color=alt.Color("trips:Q", scale=alt.Scale(scheme="yelloworangered"), title="Trips"),
+                color=alt.Color("trips:Q", scale=alt.Scale(scheme="yelloworangered"),
+                                legend=alt.Legend(title="Trips", orient="right")),
                 tooltip=["dow", "hour", "trips"],
             ).properties(height=280)
         )
@@ -271,17 +525,18 @@ with tab_dashboard:
 
     with c2:
         st.subheader("Daily revenue")
-        st.caption("Sum of total_amount, per day. From the gold_daily table.")
-        daily = (silver.assign(date=silver["tpep_pickup_datetime"].dt.date)
-                       .groupby("date")
-                       .agg(revenue=("total_amount", "sum"), trips=("fare_amount", "count"))
-                       .reset_index())
+        st.caption("Sum of total_amount per day. Gold layer.")
+        daily = (silver_f.assign(date=silver_f["tpep_pickup_datetime"].dt.date)
+                         .groupby("date")
+                         .agg(revenue=("total_amount", "sum"), trips=("fare_amount", "count"))
+                         .reset_index())
         line = (
             alt.Chart(daily).mark_area(
-                line={"color": "#FFC72C"}, color=alt.Gradient(
+                line={"color": BRAND_YELLOW, "strokeWidth": 2},
+                color=alt.Gradient(
                     gradient="linear",
-                    stops=[alt.GradientStop(color="#FFC72C", offset=0),
-                           alt.GradientStop(color="#1A1A1A", offset=1)],
+                    stops=[alt.GradientStop(color=BRAND_YELLOW, offset=0),
+                           alt.GradientStop(color=BRAND_INK2, offset=1)],
                     x1=1, x2=1, y1=1, y2=0,
                 ),
             ).encode(
@@ -297,96 +552,127 @@ with tab_dashboard:
 # ------- Driver tab -------
 with tab_driver:
     c1, c2 = st.columns([2, 3])
-
     with c1:
         st.subheader("Best pickup zones")
         st.caption("Top 10 zones by average tip. Minimum 5 trips.")
         top = high_tip.sort_values("avg_tip", ascending=False).head(10).copy()
         top = top.rename(columns={"PULocationID": "Zone", "trips": "Trips", "avg_tip": "Avg tip ($)"})
+        tip_max = float(top["Avg tip ($)"].max())
         st.dataframe(
-            top.style.background_gradient(subset=["Avg tip ($)"], cmap="YlOrRd")
-                     .format({"Avg tip ($)": "${:.2f}"}),
-            use_container_width=True, hide_index=True,
+            top,
+            use_container_width=True, hide_index=True, height=380,
+            column_config={
+                "Zone": st.column_config.NumberColumn(width="small"),
+                "Trips": st.column_config.NumberColumn(width="small"),
+                "Avg tip ($)": st.column_config.ProgressColumn(
+                    "Avg tip ($)", format="$%.2f", min_value=0, max_value=tip_max,
+                ),
+            },
         )
 
     with c2:
         st.subheader("Fairness audit — per-borough MAE")
-        st.caption("How much the tip model misses by, in each borough. The brand promise: no borough gets worse service.")
+        st.caption("How much the tip model misses by, per borough. The brand promise: no borough gets worse service.")
+        chart_data = fairness.copy()
         bar = (
-            alt.Chart(fairness).mark_bar(cornerRadius=4).encode(
-                x=alt.X("borough:N", sort="-y", title=None),
-                y=alt.Y("mae:Q", title="Mean absolute error ($)"),
+            alt.Chart(chart_data).mark_bar(cornerRadius=4).encode(
+                y=alt.Y("borough:N", sort="-x", title=None),
+                x=alt.X("mae:Q", title="Mean absolute error ($)"),
                 color=alt.Color("mae:Q", scale=alt.Scale(scheme="yelloworangered"), legend=None),
                 tooltip=["borough", alt.Tooltip("mae:Q", format="$.3f")],
-            ).properties(height=240)
+            )
         )
-        st.altair_chart(bar, use_container_width=True)
+        avg_rule = alt.Chart(pd.DataFrame({"avg": [chart_data["mae"].mean()]})).mark_rule(
+            color="white", strokeDash=[4, 4], opacity=0.6,
+        ).encode(x="avg:Q")
+        st.altair_chart((bar + avg_rule).properties(height=240), use_container_width=True)
         st.caption(
-            f"**Honest limit:** on the 10k synthetic sample the gap is ${fairness_gap:.2f} — "
-            "low because the sample is uniform. On real 2.9M-row TLC data, borough gaps "
-            "are the first thing a fairness review would flag."
+            f"Dashed line = average MAE across boroughs (${chart_data['mae'].mean():.2f}). "
+            f"Gap of ${fairness_gap:.2f} on the 10k sample; on real 2.9M-row data this would be the first flag."
         )
 
     st.divider()
-    st.subheader("Tip prediction for a specific trip")
-    with st.form("tip_form"):
-        c1, c2, c3 = st.columns(3)
-        distance = c1.number_input("Trip distance (miles)", 0.1, 50.0, 2.5, 0.1)
-        fare = c2.number_input("Fare amount ($)", 2.5, 200.0, 15.0, 0.5)
-        duration = c3.number_input("Trip duration (min)", 1, 180, 12, 1)
-        c4, c5, c6 = st.columns(3)
-        borough = c4.selectbox("Pickup borough", BOROUGHS, index=0)
-        hour = c5.slider("Hour of day", 0, 23, 18)
-        is_weekend = c6.toggle("Weekend?", value=False)
-        submitted = st.form_submit_button("Predict tip", type="primary")
+    st.subheader("Tip prediction — live")
+    st.caption("Drag to see the model's prediction update in real time. ± MAE confidence band shown below.")
+    c1, c2, c3 = st.columns(3)
+    distance = c1.slider("Trip distance (miles)", 0.1, 50.0, 2.5, 0.1)
+    fare = c2.slider("Fare amount ($)", 2.5, 200.0, 15.0, 0.5)
+    duration = c3.slider("Trip duration (min)", 1, 180, 12, 1)
+    c4, c5, c6 = st.columns(3)
+    borough = c4.selectbox("Pickup borough", BOROUGHS, index=0)
+    hour = c5.slider("Hour of day", 0, 23, 18)
+    is_weekend = c6.toggle("Weekend?", value=False)
 
-    if submitted:
-        row = pd.DataFrame([{
-            "trip_distance": distance, "fare_amount": fare, "trip_duration_min": duration,
-            "passenger_count": 1, "hour": hour, "dow": 5 if is_weekend else 2,
-            "is_weekend": int(is_weekend), "pickup_borough": borough,
-        }])
-        predicted = float(tip_model.predict(row)[0])
-        pct = predicted / fare * 100
-        a, b = st.columns(2)
-        a.metric("Predicted tip", f"${predicted:.2f}", f"{pct:.1f}% of fare")
-        b.caption(
-            "**Honest limit:** on the 10k sample this model's hold-out R² is near zero — "
-            "it barely beats a linear baseline. On the real 2.9M-row dataset the gap is "
-            "meaningful. See About for the full numbers."
+    row = pd.DataFrame([{
+        "trip_distance": distance, "fare_amount": fare, "trip_duration_min": duration,
+        "passenger_count": 1, "hour": hour, "dow": 5 if is_weekend else 2,
+        "is_weekend": int(is_weekend), "pickup_borough": borough,
+    }])
+    predicted = float(tip_model.predict(row)[0])
+    pct = predicted / fare * 100
+    lo, hi = max(0, predicted - overall_mae), predicted + overall_mae
+
+    a, b, c = st.columns([1, 1, 2])
+    with a:
+        kpi_card("Predicted tip", f"${predicted:.2f}", f"{pct:.1f}% of fare", "💝", "#50C878")
+    with b:
+        kpi_card("± MAE band", f"${lo:.2f} – ${hi:.2f}", f"±${overall_mae:.2f} typical error", "📏", "#4A90E2")
+    with c:
+        st.markdown(
+            f"""
+            <div class="insight" style="height:100%;display:flex;align-items:center;">
+              <div><span class="insight-tag">Honest limit</span>
+              on the 10k sample this model's hold-out R² is near zero — it barely beats
+              a linear baseline. On the real 2.9M-row dataset the gap is meaningful.
+              Baseline-first is the Phase 2 lesson, not a defect to hide.</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
         )
 
 
 # ------- Analytics tab -------
 with tab_analytics:
     st.subheader("Natural-language query")
-    st.caption("Ask a question. Matches one of 3 known patterns; otherwise returns 'not supported' (safety by default).")
+    st.caption("Try one of the examples below, or ask your own. Out-of-domain questions return 'not supported' (safety by default).")
 
-    q = st.text_input(
-        "Your question",
-        value="What was the average fare?",
-        placeholder="e.g. How many trips from JFK? / average tip / busiest hour",
-    )
-    if st.button("Ask") and q:
+    if "nl_query" not in st.session_state:
+        st.session_state.nl_query = "What was the average fare?"
+
+    examples = [
+        "Trips from JFK?",
+        "Trips to Brooklyn?",
+        "Average fare?",
+        "Average tip?",
+        "Busiest hour?",
+    ]
+    cols = st.columns(len(examples))
+    for col, ex in zip(cols, examples):
+        if col.button(ex, use_container_width=True, key=f"ex_{ex}"):
+            st.session_state.nl_query = ex
+
+    q = st.text_input("Your question", key="nl_query")
+    if q:
         sql = nl_to_sql(q)
         if sql is None:
-            st.warning("No pattern matched. Try: trips from <place>, average fare, busiest hour.")
+            st.warning("No pattern matched. Try one of the example chips above.")
         else:
             st.code(sql, language="sql")
-            st.dataframe(run_sql(sql, silver), use_container_width=True, hide_index=True)
+            result = run_sql(sql, silver_f)
+            st.dataframe(result, use_container_width=True, hide_index=True)
 
-    with st.expander("Supported patterns"):
+    with st.expander("Supported patterns (3)"):
         st.markdown(
             "- **Location filter**: `trips from JFK` → `SELECT COUNT(*) WHERE PULocationID = 132`\n"
             "- **Aggregate**: `average fare` → `SELECT AVG(fare_amount) FROM silver`\n"
             "- **Peak time**: `busiest hour` → `SELECT hour, COUNT(*) GROUP BY 1 ORDER BY 2 DESC LIMIT 1`\n"
-            "\nUpgrade path: swap `nl_to_sql()` for a real LLM + SELECT-only allowlist validator."
+            "\nUpgrade path: swap `nl_to_sql()` for a real LLM + a SELECT-only allowlist validator."
         )
 
     st.divider()
     st.subheader("Top 10 pickup zones")
-    top_zones = (silver.groupby("PULocationID").size().rename("trips")
-                       .reset_index().sort_values("trips", ascending=False).head(10))
+    top_zones = (silver_f.groupby("PULocationID").size().rename("trips")
+                         .reset_index().sort_values("trips", ascending=False).head(10))
     zone_bar = (
         alt.Chart(top_zones).mark_bar(cornerRadius=4).encode(
             x=alt.X("trips:Q", title="Trips"),
@@ -404,39 +690,41 @@ with tab_about:
         f"""
         ## About
 
-        **NYCRide Analytics** is the flagship capstone of the Bits to Builds course. It's a 3-phase
-        end-to-end taxi analytics platform:
+        **NYCRide Analytics** is the flagship capstone of the
+        [Bits to Builds](https://bitstobuilds.com) course — a 3-phase end-to-end
+        taxi analytics platform spanning DE, ML, forecasting and NL-SQL.
 
         | Phase | Track | Deliverable |
         |-------|-------|-------------|
-        | 1. Pipeline       | DE          | bronze→silver→gold, 10 invariants, rejects documented |
-        | 2. ML + fairness  | ML          | tip-prediction GBM, 5-borough fairness audit |
-        | 3. Forecast + NLQ | DL/DA/GenAI | hour-ahead demand GBM + NL→SQL analytics |
+        | 1. Pipeline       | DE          | bronze→silver→gold medallion, 10 invariants, reject counts documented |
+        | 2. ML + fairness  | ML          | tip-prediction GBM, 5-borough fairness audit, baseline-first |
+        | 3. Forecast + NLQ | DL/DA/GenAI | hour-ahead demand GBM + NL→SQL interface (3 patterns, None-safe) |
 
         ## Data
 
         [NYC TLC Yellow Taxi Trip Data](https://www.nyc.gov/site/tlc/about/tlc-trip-record-data.page),
-        public domain. This Space uses a deterministic 10,000-row synthetic sample so cold-starts
-        are fast on the Streamlit Cloud free tier; the pipeline runs on the full ~3M-row monthly file
-        when pointed at real parquet.
+        public domain. This Space uses a deterministic 10,000-row synthetic sample so
+        cold-starts fit in the Streamlit Cloud free tier; the pipeline runs on the full
+        ~3M-row monthly file when pointed at real parquet.
 
         ## Honest limits
 
-        - **Tip model barely beats baseline on the 10k sample.** GBM MAE ≈ $3.79 vs linear baseline
-          MAE ≈ $3.78. On real 2.9M-row data the gap widens. Shipped the baseline-first result on
-          purpose — that's the Phase 2 lesson.
-        - **Fairness gap on this sample: ${fairness_gap:.2f}.** Low because the sample is uniform
-          across boroughs. On real data this is the first thing a fairness review would flag.
-        - **Map coordinates are synthesised.** The TLC data gives zone IDs, not lat/lon. We jitter
-          around borough centroids deterministically; on real data, join against
+        - **Tip model barely beats baseline on the 10k sample.** GBM MAE ≈ ${overall_mae:.2f}
+          vs linear baseline near-identical. On real 2.9M-row data the gap widens.
+          Shipped the baseline-first result on purpose — the Phase 2 lesson.
+        - **Fairness gap on this sample: ${fairness_gap:.2f}.** Low because the sample is
+          uniform across boroughs. On real data this is the first thing a fairness
+          review would flag.
+        - **Map coordinates are synthesised.** TLC gives zone IDs, not lat/lon. We jitter
+          deterministically around borough centroids; on real data, join against
           `taxi_zone_lookup.csv`.
-        - **NL→SQL handles 3 patterns.** Anything else returns `None` (safety). Upgrade: wrap an
-          LLM in a SELECT-only allowlist validator.
+        - **NL→SQL handles 3 patterns.** Anything else returns `None` (safety). Upgrade:
+          wrap an LLM in a SELECT-only allowlist validator.
 
         ## Source
 
-        [github.com/PJsAcademy/nycride-analytics](https://github.com/PJsAcademy/nycride-analytics) —
-        26 pytest invariants, Dockerfile for self-hosted deploy, portfolio-review scaffolding
-        under `templates/portfolio/`.
+        [github.com/PJsAcademy/nycride-analytics](https://github.com/PJsAcademy/nycride-analytics)
+        — 26 pytest invariants, Dockerfile for self-hosted deploy, portfolio-review
+        scaffolding (`templates/portfolio/`).
         """
     )
