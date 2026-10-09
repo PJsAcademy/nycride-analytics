@@ -19,6 +19,7 @@ Deploy: push the repo to a Hugging Face Space with the Streamlit SDK (see README
 from __future__ import annotations
 
 import re
+import sys
 from pathlib import Path
 
 import joblib
@@ -26,8 +27,41 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-CHECKPOINTS = Path(__file__).parent / "checkpoints"
+HERE = Path(__file__).parent
+CHECKPOINTS = HERE / "checkpoints"
 BOROUGHS = ["Manhattan", "Bronx", "Brooklyn", "Queens", "Staten Island"]
+
+# Make src/ importable so we can call the phase pipelines in-process when
+# checkpoints are missing (first cold start on a fresh container).
+sys.path.insert(0, str(HERE / "src"))
+
+
+@st.cache_resource(show_spinner="First-time setup: building silver + ML + forecast (~30s)...")
+def bootstrap_checkpoints() -> None:
+    """If any checkpoint is missing OR fails to load (e.g. sklearn version shift
+    broke the pickle), rebuild everything from source. Deterministic (seed=42),
+    runs once per container."""
+    required = [
+        CHECKPOINTS / "silver.parquet",
+        CHECKPOINTS / "tip_model.pkl",
+        CHECKPOINTS / "high_tip_zones.csv",
+        CHECKPOINTS / "demand_model.pkl",
+    ]
+    if all(p.exists() for p in required):
+        try:
+            joblib.load(CHECKPOINTS / "tip_model.pkl")
+            joblib.load(CHECKPOINTS / "demand_model.pkl")
+            return
+        except Exception:
+            pass
+    CHECKPOINTS.mkdir(exist_ok=True)
+    import phase1_pipeline, phase2_ml, phase3_forecast
+    phase1_pipeline.main()
+    phase2_ml.main()
+    phase3_forecast.main()
+
+
+bootstrap_checkpoints()
 
 
 # ======================================================= loaders (cached)

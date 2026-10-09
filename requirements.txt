@@ -1,6 +1,9 @@
-streamlit==1.39.0
-pandas==2.2.3
-numpy==1.26.4
-scikit-learn==1.5.2
-joblib==1.4.2
-pyarrow==17.0.0
+# Loose lower bounds so uv on any recent Python (3.11 / 3.12 / 3.13 / 3.14)
+# can resolve a wheel for every package. No exact pins — Streamlit Cloud's
+# default runtime moves, and pinning to a specific wheel breaks on bumps.
+streamlit>=1.39
+pandas>=2.2
+numpy>=1.26
+scikit-learn>=1.5
+joblib>=1.4
+pyarrow>=17
